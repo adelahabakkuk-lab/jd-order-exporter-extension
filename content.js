@@ -1,4 +1,7 @@
 (() => {
+  if (window.top !== window.self) {
+    return;
+  }
   if (window.__jdLocalOrderExporterLoaded) {
     return;
   }
@@ -105,10 +108,7 @@
 
         const listUrl = buildListUrl(range.value, options.status || "4096", page);
         updateOverlay(`读取 ${range.label} 第 ${page} 页，已收集 ${ordersById.size} 个订单...`);
-        const html = await fetchText(listUrl);
-        assertLoggedIn(html, listUrl);
-        const doc = parseHtml(html);
-        const pageOrders = parseOrderList(doc, range.label, batch);
+        const pageOrders = await scrapeListPage(listUrl, range.label, batch);
 
         for (const order of pageOrders) {
           if (!ordersById.has(order["订单编号"])) {
@@ -116,7 +116,7 @@
           }
         }
 
-        const shouldStop = pageOrders.length === 0 || hasListEnded(doc);
+        const shouldStop = pageOrders.length === 0;
         if (shouldStop) {
           break;
         }
@@ -125,6 +125,8 @@
         await delay(options.delayMs);
       }
     }
+
+    removeExportIframe();
 
     const orders = Array.from(ordersById.values());
     if (options.includeDetails && !cancelRequested) {
@@ -298,6 +300,179 @@
     }
 
     return orders;
+  }
+
+  let exportIframe = null;
+
+  function ensureExportIframe() {
+    if (exportIframe && document.body.contains(exportIframe)) {
+      return exportIframe;
+    }
+    exportIframe = document.createElement("iframe");
+    exportIframe.id = "jd-local-exporter-frame";
+    exportIframe.style.cssText = "position:fixed;left:0;top:0;width:100vw;height:100vh;opacity:0;pointer-events:none;border:0;z-index:-1";
+    document.body.appendChild(exportIframe);
+    return exportIframe;
+  }
+
+  function removeExportIframe() {
+    if (exportIframe) {
+      exportIframe.remove();
+      exportIframe = null;
+    }
+  }
+
+  async function scrapeListPage(url, dateLabel, batch) {
+    const iframe = ensureExportIframe();
+    const loadPromise = new Promise((resolve) => {
+      const timer = setTimeout(resolve, 20000);
+      iframe.addEventListener("load", () => {
+        clearTimeout(timer);
+        resolve();
+      }, { once: true });
+    });
+    iframe.src = url;
+    await loadPromise;
+    const kind = await waitForRenderedList(iframe);
+    const doc = iframe.contentDocument;
+    if (!doc) {
+      return [];
+    }
+    if (kind === "old") {
+      return parseOrderList(doc, dateLabel, batch);
+    }
+    return parseNewOrderList(doc, dateLabel, batch);
+  }
+
+  async function waitForRenderedList(iframe) {
+    const startedAt = Date.now();
+    let lastCount = -1;
+    let stablePolls = 0;
+    while (Date.now() - startedAt < 25000) {
+      const doc = iframe.contentDocument;
+      if (doc) {
+        const hasLoginForm = Boolean(doc.querySelector("#loginname, #nloginpwd, #loginsubmit, .login-tab, .login-form"));
+        const isLoginTitle = /京东-欢迎登录|欢迎登录/.test(clean(doc.title));
+        if (hasLoginForm || isLoginTitle) {
+          throw new Error("登录状态不可用，请刷新订单页并确认已登录。");
+        }
+        const cardCount = doc.querySelectorAll('[class*="orderCard-"]').length;
+        const oldCount = doc.querySelectorAll(".td-void > tbody").length;
+        if (oldCount > 0) {
+          return "old";
+        }
+        if (cardCount > 0) {
+          if (cardCount === lastCount) {
+            stablePolls += 1;
+            if (stablePolls >= 3) {
+              return "new";
+            }
+          } else {
+            lastCount = cardCount;
+            stablePolls = 0;
+          }
+        } else if (doc.readyState === "complete" && Date.now() - startedAt > 3000) {
+          const bodyText = clean(doc.body ? doc.body.textContent : "");
+          if (/暂无订单|没有订单|暂无数据|空空如也|暂未/.test(bodyText)) {
+            return "new";
+          }
+        }
+      }
+      await delay(400);
+    }
+    const doc = iframe.contentDocument;
+    if (doc && doc.querySelectorAll('[class*="orderCard-"]').length > 0) {
+      return "new";
+    }
+    return "new";
+  }
+
+  function byClassPrefix(root, prefix) {
+    return root.querySelector(`[class*="${prefix}"]`);
+  }
+
+  function textByClassPrefix(root, prefix) {
+    const node = byClassPrefix(root, prefix);
+    return node ? clean(node.textContent) : "";
+  }
+
+  function parseNewOrderList(doc, dateLabel, batch) {
+    const cards = Array.from(doc.querySelectorAll('[class*="orderCard-"]'));
+    const orders = [];
+
+    for (const card of cards) {
+      const idNode = card.querySelector('[class*="orderMetas-"] [class*="metaValue-"]');
+      const orderId = firstMatch(clean(idNode && (idNode.getAttribute("title") || idNode.textContent)), /\d{6,}/);
+      if (!orderId) {
+        continue;
+      }
+
+      const timeNode = card.querySelector('[class*="orderTime-"] [class*="metaValue-"]');
+      const items = parseNewGoods(card);
+      const priceInteger = textByClassPrefix(card, "priceInteger-");
+      const priceDecimal = textByClassPrefix(card, "priceDecimal-");
+      const actualPayment = priceInteger ? `${priceInteger}${priceDecimal || ".00"}` : "";
+      const cardText = clean(card.textContent);
+      const logisticsText = textByClassPrefix(card, "detailText-");
+      const userName = textByClassPrefix(card, "userName-");
+      let address = textByClassPrefix(card, "deliveryTextGroup-");
+      if (userName && address.startsWith(userName)) {
+        address = address.slice(userName.length).trim();
+      }
+      const beansNode = byClassPrefix(card, "jingDouReceived-");
+      const shopNode = byClassPrefix(card, "shopNames-");
+
+      orders.push({
+        "导出批次": batch,
+        "日期范围": dateLabel,
+        "订单编号": orderId,
+        "父订单编号": "",
+        "店铺名称": shopNode ? clean(shopNode.getAttribute("title") || shopNode.textContent) : "",
+        "商品编号": items.map((item) => item["商品编号"]).filter(Boolean).join("\n"),
+        "商品名称": items.map((item) => item["商品名称"]).filter(Boolean).join("\n"),
+        "商品数量": items.map((item) => item["数量"]).filter((item) => item !== "").join("\n"),
+        "实付金额": actualPayment,
+        "支付方式": textByClassPrefix(card, "paymentTypeName-"),
+        "付款时间": "",
+        "订单返豆": beansNode ? parseInteger(beansNode.textContent) : "",
+        "京豆抵扣金额": "",
+        "下单时间": clean(timeNode && timeNode.textContent),
+        "订单状态": textByClassPrefix(card, "statusText-"),
+        "收货人姓名": userName,
+        "收货地址": address,
+        "收货人电话": "",
+        "物流公司": valueByPatterns(logisticsText, [/交付([\u4e00-\u9fa5A-Za-z]+)快递/, /由([\u4e00-\u9fa5A-Za-z]+)承运/]),
+        "快递单号": valueByPatterns(logisticsText, [/运单号为\s*([A-Za-z0-9-]+)/, /运单号[:：]\s*([A-Za-z0-9-]+)/]),
+        "配送方式": "",
+        "商品总价": "",
+        "运费": "",
+        "详情补充状态": "新版页面抓取",
+        "订单详情域名路径": "",
+        "商品明细JSON": JSON.stringify(items),
+        "有售后入口": /申请售后/.test(cardText) ? "是" : "否",
+        "有发票入口": /查看发票|发票详情/.test(cardText) ? "是" : "否",
+        "_detailUrl": ""
+      });
+    }
+
+    return orders;
+  }
+
+  function parseNewGoods(card) {
+    return Array.from(card.querySelectorAll('[class*="productItem-"]')).map((item) => {
+      const link = item.querySelector('a[href*="item.jd.com"]') || item.querySelector("a");
+      const href = link ? normalizeUrl(link.getAttribute("href")) : "";
+      const idMatch = href.match(/\/(\d+)\.html/);
+      const productId = idMatch ? idMatch[1] : "";
+      const titleNode = item.querySelector('[class*="productTitle-"]');
+      const quantityNode = item.querySelector('[class*="countNum-"]');
+      return {
+        "商品编号": productId || "",
+        "商品名称": titleNode ? clean(titleNode.getAttribute("title") || titleNode.textContent) : clean(link ? link.getAttribute("title") || link.textContent : ""),
+        "数量": quantityNode ? clean(quantityNode.textContent) : "",
+        "商品链接": href ? stripQuery(href) : ""
+      };
+    }).filter((item) => item["商品名称"] || item["商品编号"]);
   }
 
   function parseGoods(row) {
